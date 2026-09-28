@@ -2183,6 +2183,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state_is_stale(context):
         clear_flow_state(context)
 
+    # Handle the numeric question-count reply before the general menu fallback.
+    if context.user_data.get("awaiting_question_count"):
+        if not text.isdecimal():
+            await update.message.reply_text(
+                f"❌ اكتب عددًا صحيحًا من {MIN_QUESTIONS} إلى {MAX_QUESTIONS}.\n"
+                "أو أرسل /cancel للإلغاء."
+            )
+            return
+
+        n_questions = int(text)
+        if not MIN_QUESTIONS <= n_questions <= MAX_QUESTIONS:
+            await update.message.reply_text(
+                f"❌ العدد لازم يكون من {MIN_QUESTIONS} إلى {MAX_QUESTIONS}. "
+                "جرّب رقمًا تانيًا أو أرسل /cancel للإلغاء."
+            )
+            return
+
+        have_content = (context.user_data.get("pdf_text") or
+                        context.user_data.get("pdf_images") or
+                        context.user_data.get("image_data"))
+        if not have_content:
+            clear_quiz_only(context)
+            await update.message.reply_text("انتهت بيانات الملف. ابعت PDF أو صورة من جديد 📄")
+            return
+
+        touch_state(context)
+        await generate_mcqs_and_send(update, context, n_questions)
+        return
+
     if is_admin(user_id) and text == BTN_TOGGLE_VIRTUAL_PATIENT:
         await _set_virtual_patient_enabled(not _VIRTUAL_PATIENT_ENABLED)
         state = "✅ شغال" if _VIRTUAL_PATIENT_ENABLED else "🛑 متوقف"
