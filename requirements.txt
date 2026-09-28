@@ -42,3 +42,4 @@ Pillow                         # image <-> PDF handling
 # The pure-Python tools (Image<->PDF, merge, split, compress, PDF->Word) work
 # without it, and the menu hides the LibreOffice-only buttons when it's absent.
 fpdf==1.7.2
+sqlalchemy[asyncio]
