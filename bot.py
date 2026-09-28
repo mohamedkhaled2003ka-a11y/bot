@@ -2169,6 +2169,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state_is_stale(context):
         clear_flow_state(context)
+    # ── MCQ: awaiting question count ──
+    if context.user_data.get("awaiting_question_count"):
+        try:
+            n_questions = int(text)
+            if n_questions < MIN_QUESTIONS or n_questions > MAX_QUESTIONS:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                f"❌ اكتب رقم صحيح من {MIN_QUESTIONS} لـ {MAX_QUESTIONS}.",
+                reply_markup=get_keyboard_for(user_id)
+            )
+            return
+
+        context.user_data.pop("awaiting_question_count", None)
+        await generate_mcqs_and_send(update, context, n_questions)
+        return
 
     if is_admin(user_id) and text == BTN_TOGGLE_VIRTUAL_PATIENT:
         await _set_virtual_patient_enabled(not _VIRTUAL_PATIENT_ENABLED)
