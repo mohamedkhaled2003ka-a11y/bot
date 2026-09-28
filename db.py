@@ -20,6 +20,7 @@ and the SQLAlchemy models stay the same — only the engine URL changes.
 from __future__ import annotations
 
 import os
+import json
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
@@ -126,6 +127,44 @@ class BotState(Base):
 
     key:   Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text, default="")
+
+
+class PdfTokenBalance(Base):
+    __tablename__ = "pdf_token_balances"
+
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tokens: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class VirtualPatientSession(Base):
+    __tablename__ = "virtual_patient_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), default="")
+    specialty: Mapped[str] = mapped_column(String(64), default="")
+    difficulty: Mapped[str] = mapped_column(String(16), default="")
+    case_json: Mapped[str] = mapped_column(Text, default="{}")
+    history_json: Mapped[str] = mapped_column(Text, default="[]")
+    examinations_json: Mapped[str] = mapped_column(Text, default="[]")
+    investigations_json: Mapped[str] = mapped_column(Text, default="[]")
+    started_at: Mapped[str] = mapped_column(String(32), default="")
+    ended_at: Mapped[str] = mapped_column(String(32), default="")
+    final_score: Mapped[int] = mapped_column(Integer, default=0)
+    score_json: Mapped[str] = mapped_column(Text, default="{}")
+    feedback: Mapped[str] = mapped_column(Text, default="")
+    completed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
+class RegisteredChat(Base):
+    __tablename__ = "registered_chats"
+
+    chat_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    title: Mapped[str] = mapped_column(String(256), default="")
+    chat_type: Mapped[str] = mapped_column(String(32), default="")
+    registered_at: Mapped[str] = mapped_column(String(32), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -251,6 +290,67 @@ async def list_allowed_user_ids() -> list[int]:
             select(User.id).where(User.allowed == True).order_by(User.id)
         )).scalars().all()
         return list(rows)
+
+
+async def register_chat(chat_id: int, owner_user_id: int, title: str,
+                        chat_type: str) -> dict:
+    async with async_session_factory() as s:
+        row = await s.get(RegisteredChat, chat_id)
+        if row is None:
+            row = RegisteredChat(
+                chat_id=chat_id,
+                owner_user_id=owner_user_id,
+                title=title[:256],
+                chat_type=chat_type[:32],
+                registered_at=_now_iso(),
+                enabled=False,
+            )
+            s.add(row)
+        else:
+            row.owner_user_id = owner_user_id
+            row.title = title[:256]
+            row.chat_type = chat_type[:32]
+        await s.commit()
+        return {
+            "chat_id": row.chat_id,
+            "owner_user_id": row.owner_user_id,
+            "title": row.title,
+            "chat_type": row.chat_type,
+            "registered_at": row.registered_at,
+            "enabled": row.enabled,
+        }
+
+
+async def list_registered_chats(enabled_only: bool = False) -> list[dict]:
+    async with async_session_factory() as s:
+        query = select(RegisteredChat).order_by(RegisteredChat.registered_at.desc())
+        if enabled_only:
+            query = query.where(RegisteredChat.enabled == True)
+        rows = (await s.execute(query)).scalars().all()
+        return [{
+            "chat_id": row.chat_id,
+            "owner_user_id": row.owner_user_id,
+            "title": row.title,
+            "chat_type": row.chat_type,
+            "registered_at": row.registered_at,
+            "enabled": row.enabled,
+        } for row in rows]
+
+
+async def set_chat_enabled(chat_id: int, enabled: bool) -> bool:
+    async with async_session_factory() as s:
+        row = await s.get(RegisteredChat, chat_id)
+        if row is None:
+            return False
+        row.enabled = bool(enabled)
+        await s.commit()
+        return True
+
+
+async def is_chat_enabled(chat_id: int) -> bool:
+    async with async_session_factory() as s:
+        row = await s.get(RegisteredChat, chat_id)
+        return bool(row and row.enabled)
 
 
 async def count_allowed_users() -> int:
@@ -406,6 +506,153 @@ async def set_state(key: str, value: str):
 
 
 # ─────────────────────────────────────────────────────────────
+# AI PDF restyling tokens
+# ─────────────────────────────────────────────────────────────
+async def get_pdf_tokens(user_id: int) -> int:
+    async with async_session_factory() as s:
+        row = await s.get(PdfTokenBalance, user_id)
+        return max(0, int(row.tokens)) if row else 0
+
+
+async def add_pdf_tokens(user_id: int, amount: int) -> int:
+    if amount == 0:
+        return await get_pdf_tokens(user_id)
+    async with async_session_factory() as s:
+        row = await s.get(PdfTokenBalance, user_id)
+        if row is None:
+            row = PdfTokenBalance(user_id=user_id, tokens=0)
+            s.add(row)
+        row.tokens = max(0, int(row.tokens) + int(amount))
+        await s.commit()
+        return row.tokens
+
+
+async def consume_pdf_tokens(user_id: int, amount: int) -> tuple[bool, int]:
+    """Consume tokens atomically enough for the single-worker SQLite flow."""
+    if amount <= 0:
+        return True, await get_pdf_tokens(user_id)
+    async with async_session_factory() as s:
+        row = await s.get(PdfTokenBalance, user_id)
+        if row is None or row.tokens < amount:
+            return False, max(0, int(row.tokens)) if row else 0
+        row.tokens -= amount
+        await s.commit()
+        return True, row.tokens
+
+
+# ─────────────────────────────────────────────────────────────
+# Virtual patient sessions and score history
+# ─────────────────────────────────────────────────────────────
+def _json_loads(raw: str, fallback):
+    try:
+        value = json.loads(raw or "")
+        return value if value is not None else fallback
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+
+
+def _session_dict(row: VirtualPatientSession | None) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "user_id": row.user_id,
+        "case_id": row.case_id,
+        "specialty": row.specialty,
+        "difficulty": row.difficulty,
+        "case": _json_loads(row.case_json, {}),
+        "history": _json_loads(row.history_json, []),
+        "examinations": _json_loads(row.examinations_json, []),
+        "investigations": _json_loads(row.investigations_json, []),
+        "started_at": row.started_at,
+        "ended_at": row.ended_at,
+        "final_score": row.final_score,
+        "score": _json_loads(row.score_json, {}),
+        "feedback": row.feedback,
+        "completed": row.completed,
+    }
+
+
+async def save_virtual_patient_session(user_id: int, session: dict):
+    async with async_session_factory() as s:
+        session_id = session.get("session_id")
+        row = await s.get(VirtualPatientSession, int(session_id)) if session_id else None
+        if row is None and session.get("case_id"):
+            row = (await s.execute(
+                select(VirtualPatientSession)
+                .where(VirtualPatientSession.user_id == user_id,
+                       VirtualPatientSession.case_id == str(session["case_id"]))
+                .order_by(VirtualPatientSession.id.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+        if row is None and not session.get("completed", False):
+            row = (await s.execute(
+                select(VirtualPatientSession)
+                .where(VirtualPatientSession.user_id == user_id,
+                       VirtualPatientSession.completed == False)
+                .order_by(VirtualPatientSession.started_at.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+        values = {
+            "case_id": str(session.get("case_id", "")),
+            "specialty": str(session.get("specialty", "")),
+            "difficulty": str(session.get("difficulty", "")),
+            "case_json": json.dumps(session.get("case", {}), ensure_ascii=False),
+            "history_json": json.dumps(session.get("history", []), ensure_ascii=False),
+            "examinations_json": json.dumps(session.get("examinations", []), ensure_ascii=False),
+            "investigations_json": json.dumps(session.get("investigations", []), ensure_ascii=False),
+            "started_at": str(session.get("started_at", "")),
+            "ended_at": str(session.get("ended_at", "")),
+            "final_score": int(session.get("final_score", 0) or 0),
+            "score_json": json.dumps(session.get("score", {}), ensure_ascii=False),
+            "feedback": str(session.get("feedback", "")),
+            "completed": bool(session.get("completed", False)),
+        }
+        if row is None:
+            s.add(VirtualPatientSession(user_id=user_id, **values))
+        else:
+            for key, value in values.items():
+                setattr(row, key, value)
+        await s.commit()
+        if row is not None:
+            session["session_id"] = row.id
+
+
+async def get_virtual_patient_session(user_id: int, active_only: bool = False) -> dict | None:
+    async with async_session_factory() as s:
+        query = select(VirtualPatientSession).where(
+            VirtualPatientSession.user_id == user_id)
+        if active_only:
+            query = query.where(VirtualPatientSession.completed == False)
+        row = (await s.execute(
+            query.order_by(VirtualPatientSession.started_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if row is None:
+            return None
+        result = _session_dict(row)
+        if result is not None:
+            result["session_id"] = row.id
+        return result
+
+
+async def list_virtual_patient_scores(user_id: int, limit: int = 10) -> list[dict]:
+    async with async_session_factory() as s:
+        rows = (await s.execute(
+            select(VirtualPatientSession)
+            .where(VirtualPatientSession.user_id == user_id,
+                   VirtualPatientSession.completed == True)
+            .order_by(VirtualPatientSession.ended_at.desc())
+            .limit(limit)
+        )).scalars().all()
+        results = []
+        for row in rows:
+            item = _session_dict(row)
+            if item is not None:
+                item["session_id"] = row.id
+                results.append(item)
+        return results
+
+
+# ─────────────────────────────────────────────────────────────
 # Audit logs
 # ─────────────────────────────────────────────────────────────
 async def log_generation(user_id: int, num_questions: int, source_type: str,
@@ -532,3 +779,26 @@ async def list_users_page(page: int, per_page: int) -> tuple[list[User], int]:
             .offset(offset).limit(per_page)
         )).scalars().all()
         return list(rows), total
+
+
+async def search_allowed_users(query: str, limit: int = 20) -> list[User]:
+    """Find allowed users by Telegram ID, username, or display name."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    async with async_session_factory() as s:
+        if query.isdigit():
+            rows = (await s.execute(
+                select(User).where(User.allowed == True, User.id == int(query))
+            )).scalars().all()
+        else:
+            pattern = f"%{query}%"
+            rows = (await s.execute(
+                select(User).where(
+                    User.allowed == True,
+                    (User.username.ilike(pattern)
+                     | User.first_name.ilike(pattern)
+                     | User.last_name.ilike(pattern)),
+                ).order_by(User.first_name, User.username, User.id).limit(limit)
+            )).scalars().all()
+        return list(rows[:limit])

@@ -28,7 +28,7 @@ import asyncio
 import logging
 
 import fitz  # PyMuPDF
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -38,6 +38,7 @@ from telegram.ext import (
 logger = logging.getLogger("medical")
 
 MODE_MED = "med_diag"
+MODE_CLINICAL = "clinical_case"
 MAX_PDF_IMAGES = 12
 MIN_IMG_BYTES = 6000
 
@@ -151,6 +152,161 @@ def _format(d: dict) -> str:
     return "\n".join(out)
 
 
+# ============================================================ clinical cases
+_CLINICAL_PROMPT = """You are a medical educator designing one clinical reasoning question for a senior medical student.
+Create a realistic, self-contained patient vignette focused on the most appropriate next step in diagnosis or management.
+Return ONLY valid JSON with these fields:
+{"specialty":"...","vignette":"...","question":"...","options":["...","...","...","..."],"answer":"A","explanation":"...","pearl":"..."}
+The answer must be one of A, B, C, or D. Use the same language as the requested specialty, preferably English for medical terminology.
+"""
+
+
+async def _generate_clinical_case(specialty: str = "mixed", difficulty: str = "medium") -> dict:
+    import bot
+    from google.genai import types
+    import json
+
+    schema = types.Schema(
+        type=types.Type.OBJECT,
+        required=["specialty", "vignette", "question", "options",
+                  "answer", "explanation", "pearl"],
+        properties={
+            "specialty": types.Schema(type=types.Type.STRING),
+            "vignette": types.Schema(type=types.Type.STRING),
+            "question": types.Schema(type=types.Type.STRING),
+            "options": types.Schema(
+                type=types.Type.ARRAY,
+                items=types.Schema(type=types.Type.STRING),
+            ),
+            "answer": types.Schema(
+                type=types.Type.STRING,
+                enum=["A", "B", "C", "D"],
+            ),
+            "explanation": types.Schema(type=types.Type.STRING),
+            "pearl": types.Schema(type=types.Type.STRING),
+        },
+    )
+    prompt = (f"{_CLINICAL_PROMPT}\nSpecialty: {specialty}\n"
+              f"Difficulty: {difficulty}\nReturn complete JSON only.")
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = await bot.call_gemini(
+                model=bot.GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                    temperature=0.7,
+                    max_output_tokens=2200,
+                ),
+            )
+            parsed = getattr(response, "parsed", None)
+            if parsed is not None:
+                if hasattr(parsed, "model_dump"):
+                    case = parsed.model_dump()
+                elif isinstance(parsed, dict):
+                    case = parsed
+                else:
+                    case = dict(parsed)
+            else:
+                raw = (response.text or "").strip()
+                case = json.loads(raw)
+            if isinstance(case, dict) and len(case.get("options", [])) == 4:
+                return case
+            raise ValueError("clinical response did not contain four options")
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            last_error = exc
+            logger.warning("Malformed clinical case response (attempt %d): %s",
+                           attempt + 1, exc)
+            prompt = (_CLINICAL_PROMPT + "\nCreate a shorter case. Keep every field concise. "
+                      "Return complete JSON only.")
+    raise ValueError("Gemini returned an incomplete clinical case. Please try again.") from last_error
+
+
+def _clinical_keyboard(options: list[str]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{chr(65 + i)}. {str(option)[:55]}",
+                              callback_data=f"clinical:answer:{i}")]
+        for i, option in enumerate(options)
+    ])
+
+
+def _format_clinical_case(case: dict) -> str:
+    import bot
+    esc = bot.html_escape
+    options = case.get("options") or []
+    lines = [
+        f"🧠 <b>Clinical Case: {esc(case.get('specialty', 'Mixed'))}</b>",
+        "", esc(case.get("vignette", "")), "",
+        f"<b>Question:</b> {esc(case.get('question', ''))}", "",
+    ]
+    lines.extend(f"<b>{chr(65 + i)}.</b> {esc(option)}"
+                 for i, option in enumerate(options))
+    lines.append("\n<i>Choose the single best answer.</i>")
+    return "\n".join(lines)
+
+
+async def cmd_clinical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import bot
+    if not await bot.ensure_access(update):
+        return
+    if not await bot.ensure_medical_chat_access(update):
+        return
+    context.user_data["mode"] = MODE_CLINICAL
+    status = await update.message.reply_text("🧠 جاري تجهيز حالة إكلينيكية…")
+    try:
+        case = await _generate_clinical_case()
+    except Exception as exc:
+        await status.edit_text(f"❌ مقدرتش أجهز الحالة: {bot.html_escape(str(exc))}",
+                               parse_mode="HTML")
+        return
+    context.user_data["clinical_case"] = case
+    await status.edit_text(_format_clinical_case(case), parse_mode="HTML",
+                           reply_markup=_clinical_keyboard(case["options"]))
+
+
+async def on_clinical_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    import bot
+    if not await bot.ensure_access(update):
+        return
+    case = context.user_data.get("clinical_case")
+    if not case:
+        await query.edit_message_text("الحالة انتهت. ابدأ حالة جديدة من زر الحالات الإكلينيكية.")
+        return
+    selected = int(query.data.rsplit(":", 1)[1])
+    correct_index = ord(str(case.get("answer", "A")).upper()) - ord("A")
+    options = case.get("options") or []
+    result = "✅ إجابة صحيحة" if selected == correct_index else f"❌ الإجابة الصحيحة: {chr(65 + correct_index)}"
+    selected_text = bot.html_escape(options[selected]) if selected < len(options) else ""
+    await query.edit_message_text(
+        f"{result}\n\n<b>اختيارك:</b> {selected_text}\n\n"
+        f"<b>Reasoning:</b> {bot.html_escape(case.get('explanation', ''))}\n\n"
+        f"💡 <b>Clinical pearl:</b> {bot.html_escape(case.get('pearl', ''))}\n\n{DISCLAIMER}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🧠 حالة جديدة", callback_data="clinical:new")
+        ]]),
+    )
+
+
+async def on_clinical_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    import bot
+    await query.edit_message_text("🧠 جاري تجهيز حالة إكلينيكية…")
+    try:
+        case = await _generate_clinical_case()
+        context.user_data["clinical_case"] = case
+        await query.edit_message_text(_format_clinical_case(case), parse_mode="HTML",
+                                      reply_markup=_clinical_keyboard(case["options"]))
+    except Exception as exc:
+        await query.edit_message_text(f"❌ حصل خطأ: {bot.html_escape(str(exc))}",
+                                      parse_mode="HTML")
+
+
 # ============================================================ handlers
 async def _run_image(update, context, img_bytes: bytes, mime: str):
     import bot
@@ -194,6 +350,8 @@ async def cmd_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import bot
     if not await bot.ensure_access(update):
         return
+    if not await bot.ensure_medical_chat_access(update):
+        return
     context.user_data["mode"] = MODE_MED
     await update.message.reply_text(
         "🩺 <b>التشخيص الطبي / تحليل الملفات</b>\n\n"
@@ -209,6 +367,8 @@ async def _intercept_documents(update: Update, context: ContextTypes.DEFAULT_TYP
     import bot
     if context.user_data.get("mode") != MODE_MED:
         return
+    if not await bot.ensure_medical_chat_access(update):
+        raise ApplicationHandlerStop
     doc = update.message.document
     if doc is None:
         return
@@ -237,6 +397,8 @@ async def _intercept_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import bot, addons
     if context.user_data.get("mode") != MODE_MED:
         return
+    if not await bot.ensure_medical_chat_access(update):
+        raise ApplicationHandlerStop
     if not await bot.ensure_access(update):
         raise ApplicationHandlerStop
     photo = update.message.photo[-1]
@@ -248,6 +410,9 @@ async def _intercept_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def register(app: Application):
     app.add_handler(CommandHandler("diagnose", cmd_diagnose))
+    app.add_handler(CommandHandler("clinical", cmd_clinical))
+    app.add_handler(CallbackQueryHandler(on_clinical_new, pattern=r"^clinical:new$"))
+    app.add_handler(CallbackQueryHandler(on_clinical_answer, pattern=r"^clinical:answer:\d+$"))
     # group -2 so it runs BEFORE addons' own (-1) interceptors
     app.add_handler(MessageHandler(filters.Document.ALL, _intercept_documents),
                     group=-2)

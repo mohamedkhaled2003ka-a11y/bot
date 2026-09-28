@@ -56,6 +56,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
+    ApplicationHandlerStop,
     filters,
 )
 
@@ -181,23 +182,33 @@ BTN_START_OVER    = "🏠 الرئيسية"
 BTN_SPOT          = "🔍 تشخيص صورة"
 BTN_QFILE         = "📋 كويز من ملف"
 BTN_ISLAMIC       = "🕌 إسلامي"
-BTN_PDFTOOLS      = "🛠️ أدوات PDF"
 BTN_MEDICAL       = "🩺 تشخيص طبي"
+BTN_CLINICAL      = "🧠 حالات إكلينيكية"
+BTN_VIRTUAL_PATIENT = "🩺 مريض افتراضي"
 
 BTN_ADMIN_PANEL   = "🎛️ لوحة التحكم"
 BTN_MANAGE_USERS  = "👥 إدارة المستخدمين"
+BTN_MANAGE_CHATS  = "💬 إدارة المحادثات الطبية"
 BTN_MULTI_ADD     = "➕👥 إضافة جماعية"   # Multiple Add
 BTN_TOGGLE_BOT    = "🔄 تشغيل/إيقاف"
 BTN_BOT_STATUS    = "📊 الحالة"
 BTN_ANALYTICS     = "📈 إحصائيات"
 BTN_BROADCAST     = "📢 رسالة جماعية"
+BTN_MEDIA_BROADCAST = "📸🎬 إرسال صورة/فيديو"
 BTN_HIDE_ADMIN    = "🙈 إخفاء لوحة الأدمن"
 BTN_SHOW_ADMIN    = "👁️ إظهار لوحة الأدمن"
+BTN_HIDE_FEATURES = "🙈 إخفاء الأدوات"
+BTN_SHOW_FEATURES = "👁️ إظهار الأدوات"
+BTN_PDF_RESTYLE = "✨ إعادة تنسيق PDF"
+BTN_TOGGLE_PDF_RESTYLE = "✨ PDF AI تشغيل/إيقاف"
+BTN_PDF_TOKENS = "🎟️ رصيد PDF"
+BTN_PDF_TOKEN_COST = "💰 تكلفة PDF"
 
 # v5 admin features
 BTN_BACKUP        = "💾 نسخة احتياطية"
 BTN_RESTORE       = "♻️ استعادة"
 BTN_SMARTDASH     = "🤖 لوحة الذكي"
+BTN_TOGGLE_VIRTUAL_PATIENT = "🩺 المريض الافتراضي تشغيل/إيقاف"
 
 BTN_EXIT_CHAT     = "🚪 الخروج من المحادثة"
 BTN_CLEAR_HISTORY = "🧹 مسح المحادثة"
@@ -219,12 +230,23 @@ logger.info("Loaded %d Gemini API key(s)", len(GEMINI_KEYS))
 # ============================================================
 _BOT_ENABLED: bool = True
 _ADMIN_KB_HIDDEN: bool = False
+_FEATURES_KB_HIDDEN: bool = False
+_PDF_RESTYLE_ENABLED: bool = False
+_PDF_RESTYLE_COST: int = 1
+_VIRTUAL_PATIENT_ENABLED: bool = False
 
 
 async def _load_flags():
-    global _BOT_ENABLED, _ADMIN_KB_HIDDEN
+    global _BOT_ENABLED, _ADMIN_KB_HIDDEN, _FEATURES_KB_HIDDEN, _PDF_RESTYLE_ENABLED, _PDF_RESTYLE_COST, _VIRTUAL_PATIENT_ENABLED
     _BOT_ENABLED     = (await db.get_state("enabled", "1")) == "1"
     _ADMIN_KB_HIDDEN = (await db.get_state("admin_keyboard_hidden", "0")) == "1"
+    _FEATURES_KB_HIDDEN = (await db.get_state("features_keyboard_hidden", "0")) == "1"
+    _PDF_RESTYLE_ENABLED = (await db.get_state("pdf_restyle_enabled", "0")) == "1"
+    try:
+        _PDF_RESTYLE_COST = max(1, int(await db.get_state("pdf_restyle_cost", "1")))
+    except ValueError:
+        _PDF_RESTYLE_COST = 1
+    _VIRTUAL_PATIENT_ENABLED = (await db.get_state("virtual_patient_enabled", "0")) == "1"
 
 
 async def _set_bot_enabled(value: bool):
@@ -237,6 +259,30 @@ async def _set_admin_kb_hidden(value: bool):
     global _ADMIN_KB_HIDDEN
     _ADMIN_KB_HIDDEN = value
     await db.set_state("admin_keyboard_hidden", "1" if value else "0")
+
+
+async def _set_features_kb_hidden(value: bool):
+    global _FEATURES_KB_HIDDEN
+    _FEATURES_KB_HIDDEN = value
+    await db.set_state("features_keyboard_hidden", "1" if value else "0")
+
+
+async def _set_pdf_restyle_enabled(value: bool):
+    global _PDF_RESTYLE_ENABLED
+    _PDF_RESTYLE_ENABLED = value
+    await db.set_state("pdf_restyle_enabled", "1" if value else "0")
+
+
+async def _set_pdf_restyle_cost(value: int):
+    global _PDF_RESTYLE_COST
+    _PDF_RESTYLE_COST = max(1, min(100, int(value)))
+    await db.set_state("pdf_restyle_cost", str(_PDF_RESTYLE_COST))
+
+
+async def _set_virtual_patient_enabled(value: bool):
+    global _VIRTUAL_PATIENT_ENABLED
+    _VIRTUAL_PATIENT_ENABLED = value
+    await db.set_state("virtual_patient_enabled", "1" if value else "0")
 
 
 # ============================================================
@@ -491,6 +537,19 @@ async def ensure_access(update: Update) -> bool:
     return True
 
 
+async def ensure_medical_chat_access(update: Update) -> bool:
+    """Require explicit admin approval when a medical feature runs in a group."""
+    chat = update.effective_chat
+    if chat is None or chat.type not in ("group", "supergroup"):
+        return True
+    if await db.is_chat_enabled(chat.id):
+        return True
+    await update.effective_message.reply_text(
+        "هذه المحادثة غير معتمدة بعد لاستخدام الأدوات الطبية.\n"
+        "أرسل /register_chat إلى أدمن البوت بعد تسجيل الجروب.")
+    return False
+
+
 # ============================================================
 # State management & timeout
 # ============================================================
@@ -498,6 +557,7 @@ STATE_KEYS = (
     "pdf_text", "pdf_images", "image_data", "image_mime",
     "language", "difficulty", "awaiting_question_count",
     "admin_action", "addon_action", "_state_ts",
+    "media_broadcast_target", "vp_pending",
 )
 
 
@@ -542,40 +602,67 @@ async def safe_edit(query, text: str, **kwargs):
 def build_user_reply_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(BTN_QUIZ_MODE), KeyboardButton(BTN_SMART_CHAT)],
-        [KeyboardButton(BTN_SPOT),      KeyboardButton(BTN_QFILE)],
-        [KeyboardButton(BTN_ISLAMIC),   KeyboardButton(BTN_REFERRAL)],
-        [KeyboardButton(BTN_PDFTOOLS),  KeyboardButton(BTN_MEDICAL)],
         [KeyboardButton(BTN_MY_INFO),   KeyboardButton(BTN_MY_SETTINGS)],
         [KeyboardButton(BTN_HELP)],
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+    if not _FEATURES_KB_HIDDEN:
+        keyboard[1:1] = [
+            [KeyboardButton(BTN_SPOT),      KeyboardButton(BTN_QFILE)],
+            [KeyboardButton(BTN_PDF_RESTYLE)],
+            [KeyboardButton(BTN_VIRTUAL_PATIENT)],
+            [KeyboardButton(BTN_ISLAMIC),   KeyboardButton(BTN_REFERRAL)],
+            [KeyboardButton(BTN_MEDICAL)],
+            [KeyboardButton(BTN_CLINICAL)],
+        ]
+    # Let Telegram mobile hide the keyboard when the user presses Back.
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=False)
 
 
 def build_admin_full_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(BTN_QUIZ_MODE),   KeyboardButton(BTN_SMART_CHAT)],
-        [KeyboardButton(BTN_SPOT),        KeyboardButton(BTN_QFILE)],
-        [KeyboardButton(BTN_ISLAMIC),     KeyboardButton(BTN_MY_SETTINGS)],
-        [KeyboardButton(BTN_PDFTOOLS),    KeyboardButton(BTN_MEDICAL)],
         [KeyboardButton(BTN_ADMIN_PANEL), KeyboardButton(BTN_MANAGE_USERS)],
+        [KeyboardButton(BTN_MANAGE_CHATS)],
         [KeyboardButton(BTN_MULTI_ADD),   KeyboardButton(BTN_SMARTDASH)],
+        [KeyboardButton(BTN_TOGGLE_PDF_RESTYLE), KeyboardButton(BTN_PDF_TOKENS)],
+        [KeyboardButton(BTN_PDF_TOKEN_COST)],
+        [KeyboardButton(BTN_TOGGLE_VIRTUAL_PATIENT)],
         [KeyboardButton(BTN_ANALYTICS),   KeyboardButton(BTN_BROADCAST)],
+        [KeyboardButton(BTN_MEDIA_BROADCAST)],
         [KeyboardButton(BTN_BACKUP),      KeyboardButton(BTN_RESTORE)],
         [KeyboardButton(BTN_BOT_STATUS),  KeyboardButton(BTN_TOGGLE_BOT)],
-        [KeyboardButton(BTN_HIDE_ADMIN),  KeyboardButton(BTN_HELP)],
+        [KeyboardButton(BTN_HIDE_ADMIN),
+         KeyboardButton(BTN_SHOW_FEATURES if _FEATURES_KB_HIDDEN else BTN_HIDE_FEATURES)],
+        [KeyboardButton(BTN_HELP)],
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+    if not _FEATURES_KB_HIDDEN:
+        keyboard[1:1] = [
+            [KeyboardButton(BTN_SPOT),        KeyboardButton(BTN_QFILE)],
+            [KeyboardButton(BTN_PDF_RESTYLE)],
+            [KeyboardButton(BTN_VIRTUAL_PATIENT)],
+            [KeyboardButton(BTN_ISLAMIC),     KeyboardButton(BTN_MY_SETTINGS)],
+            [KeyboardButton(BTN_MEDICAL)],
+            [KeyboardButton(BTN_CLINICAL)],
+        ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=False)
 
 
 def build_admin_hidden_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(BTN_QUIZ_MODE),  KeyboardButton(BTN_SMART_CHAT)],
-        [KeyboardButton(BTN_SPOT),       KeyboardButton(BTN_QFILE)],
-        [KeyboardButton(BTN_ISLAMIC),    KeyboardButton(BTN_MY_SETTINGS)],
-        [KeyboardButton(BTN_PDFTOOLS),   KeyboardButton(BTN_MEDICAL)],
-        [KeyboardButton(BTN_SHOW_ADMIN), KeyboardButton(BTN_HELP)],
+        [KeyboardButton(BTN_SHOW_ADMIN), KeyboardButton(BTN_SHOW_FEATURES)],
+        [KeyboardButton(BTN_HELP)],
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+    if not _FEATURES_KB_HIDDEN:
+        keyboard[1:1] = [
+            [KeyboardButton(BTN_SPOT),       KeyboardButton(BTN_QFILE)],
+            [KeyboardButton(BTN_PDF_RESTYLE)],
+            [KeyboardButton(BTN_VIRTUAL_PATIENT)],
+            [KeyboardButton(BTN_ISLAMIC),    KeyboardButton(BTN_MY_SETTINGS)],
+            [KeyboardButton(BTN_MEDICAL)],
+            [KeyboardButton(BTN_CLINICAL)],
+        ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=False)
 
 
 def build_smart_chat_keyboard() -> ReplyKeyboardMarkup:
@@ -583,7 +670,7 @@ def build_smart_chat_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(BTN_CLEAR_HISTORY)],
         [KeyboardButton(BTN_EXIT_CHAT)],
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=False)
 
 
 def get_keyboard_for(user_id: int) -> ReplyKeyboardMarkup:
@@ -619,10 +706,15 @@ def format_quota_line(u: "db.User") -> str:
 async def build_admin_panel_text() -> str:
     state = "✅ شغال" if _BOT_ENABLED else "🛑 متوقف"
     total = await db.count_allowed_users()
+    restyle_state = "✅ شغال" if _PDF_RESTYLE_ENABLED else "🛑 متوقف"
+    virtual_state = "✅ شغال" if _VIRTUAL_PATIENT_ENABLED else "🛑 متوقف"
     return (
         f"🎛️ <b>لوحة تحكم الأدمن</b>\n\n"
         f"حالة البوت: {state}\n"
         f"عدد المستخدمين: {total}\n"
+        f"إعادة تنسيق PDF بالذكاء الاصطناعي: {restyle_state}\n"
+        f"تكلفة العملية: <code>{_PDF_RESTYLE_COST}</code> token\n"
+        f"المريض الافتراضي: {virtual_state}\n"
         f"مفاتيح Gemini المحمّلة: {len(KEY_POOL) if KEY_POOL else 0}\n\n"
         f"استخدم الأزرار للتحكم 👇"
     )
@@ -636,11 +728,22 @@ def build_admin_keyboard_inline() -> InlineKeyboardMarkup:
     )
     keyboard = [
         [toggle_btn],
+        [InlineKeyboardButton(
+            ("🛑 إيقاف PDF AI" if _PDF_RESTYLE_ENABLED else "✅ تشغيل PDF AI"),
+            callback_data="admin:toggle_pdf_restyle")],
+        [InlineKeyboardButton("🎟️ منح tokens لمستخدم", callback_data="admin:pdf_tokens_prompt")],
+        [InlineKeyboardButton("💰 تغيير تكلفة العملية", callback_data="admin:pdf_cost_prompt")],
+        [InlineKeyboardButton(
+            ("🛑 إيقاف المريض الافتراضي" if _VIRTUAL_PATIENT_ENABLED else "✅ تشغيل المريض الافتراضي"),
+            callback_data="admin:toggle_virtual_patient")],
         [InlineKeyboardButton("➕ إضافة مستخدم",     callback_data="admin:add_prompt")],
         [InlineKeyboardButton("➕👥 إضافة جماعية",   callback_data="admin:multi_add_prompt")],
+        [InlineKeyboardButton("🔎 بحث عن مستخدم",    callback_data="admin:search_prompt")],
         [InlineKeyboardButton("👥 إدارة المستخدمين", callback_data="admin:list_users:0")],
+        [InlineKeyboardButton("💬 المحادثات الطبية", callback_data="admin:chats")],
         [InlineKeyboardButton("📈 إحصائيات",          callback_data="admin:analytics")],
         [InlineKeyboardButton("📢 رسالة جماعية",     callback_data="admin:broadcast_prompt")],
+        [InlineKeyboardButton("📸🎬 إرسال صورة/فيديو", callback_data="admin:media_broadcast_prompt")],
         [InlineKeyboardButton("🔄 تحديث",            callback_data="admin:refresh")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -701,6 +804,35 @@ async def build_users_list_inline(page: int = 0, bot=None) -> "tuple[str, Inline
     return text, InlineKeyboardMarkup(rows)
 
 
+async def build_user_search_results(query: str, bot=None) -> "tuple[str, InlineKeyboardMarkup]":
+    users = await db.search_allowed_users(query, limit=20)
+    if bot is not None:
+        await asyncio.gather(*[_backfill_user_name(bot, u) for u in users],
+                             return_exceptions=True)
+    if not users:
+        return (
+            f"🔎 <b>نتائج البحث</b>\n\nمفيش مستخدم مطابق لـ <code>{html_escape(query)}</code>",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔎 بحث جديد", callback_data="admin:search_prompt")
+            ], [
+                InlineKeyboardButton("🔙 رجوع", callback_data="admin:refresh")
+            ]]),
+        )
+    rows = []
+    for u in users:
+        label = u.first_name or u.username or str(u.id)
+        if u.username:
+            label += f" (@{u.username})"
+        rows.append([InlineKeyboardButton(
+            f"👤 {label[:52]}", callback_data=f"admin:user:{u.id}")])
+    rows.append([InlineKeyboardButton("🔎 بحث جديد", callback_data="admin:search_prompt")])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin:refresh")])
+    return (
+        f"🔎 <b>نتائج البحث</b>\n\nوجدت {len(users)} مستخدم لـ <code>{html_escape(query)}</code>:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
 async def build_single_user_panel(user_id: int) -> "tuple[str, InlineKeyboardMarkup]":
     u = await db.get_user(user_id)
     if u is None:
@@ -740,7 +872,7 @@ async def build_single_user_panel(user_id: int) -> "tuple[str, InlineKeyboardMar
         [InlineKeyboardButton("🎁 +3 لكتشرز هدية",    callback_data=f"admin:user:{user_id}:bonus")],
         [InlineKeyboardButton("🔄 تصفير الاستهلاك",    callback_data=f"admin:user:{user_id}:reset")],
         [InlineKeyboardButton("🗑 حذف المستخدم",       callback_data=f"admin:user:{user_id}:remove")],
-        [InlineKeyboardButton("🔙 رجوع للقائمة",       callback_data="admin:list_users:0")],
+        [InlineKeyboardButton("🔙 رجوع للقائمة",       callback_data="admin:refresh")],
     ]
     return text, InlineKeyboardMarkup(rows)
 
@@ -1052,7 +1184,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🤖 لوحة الذكي (تشغيل/تعطيل جماعي)\n"
             "💾 نسخة احتياطية / ♻️ استعادة\n"
             "📢 لإرسال رسالة جماعية\n"
-            "🙈 لإخفاء أزرار الأدمن"
+            "🙈 لإخفاء لوحة الأدمن"
         )
     else:
         u = await db.reset_today_if_needed(user_id)
@@ -1089,11 +1221,101 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await update.message.reply_text(
+    panel_message = await update.message.reply_text(
         await build_admin_panel_text(),
         parse_mode="HTML",
         reply_markup=build_admin_keyboard_inline(),
     )
+    context.user_data["admin_panel_message_id"] = panel_message.message_id
+
+
+async def register_chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Register the current group after its admin explicitly invites the bot."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if user is None or chat is None:
+        return
+    if chat.type not in ("group", "supergroup"):
+        await update.effective_message.reply_text(
+            "استخدم /register_chat داخل جروب أو سوبرجروب فقط.\n"
+            "لا يستطيع البوت اكتشاف محادثاتك الخاصة تلقائيًا.")
+        return
+    is_group_admin = is_admin(user.id)
+    if not is_group_admin:
+        try:
+            member = await context.bot.get_chat_member(chat.id, user.id)
+            is_group_admin = member.status in ("administrator", "creator")
+        except Exception:
+            logger.exception("Could not verify group administrator")
+    if not is_group_admin:
+        await update.effective_message.reply_text(
+            "❌ لازم تكون أدمن في الجروب لتسجيله.")
+        return
+    row = await db.register_chat(
+        chat_id=chat.id,
+        owner_user_id=user.id,
+        title=chat.title or str(chat.id),
+        chat_type=chat.type,
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                "💬 <b>تم تسجيل محادثة طبية جديدة</b>\n\n"
+                f"الاسم: {html_escape(row['title'])}\n"
+                f"Chat ID: <code>{row['chat_id']}</code>\n"
+                f"سجلها المستخدم: <code>{user.id}</code>\n\n"
+                "افتح لوحة الأدمن ثم إدارة المحادثات الطبية لاعتمادها.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.debug("Could not notify admin %s about chat registration", admin_id,
+                         exc_info=True)
+    await update.effective_message.reply_text(
+        "✅ تم تسجيل المحادثة الطبية وإرسالها للأدمن للمراجعة.\n"
+        "الحالة الحالية: " + ("✅ معتمدة" if row["enabled"] else "⏳ في انتظار اعتماد الأدمن")
+    )
+
+
+async def registered_chats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await send_registered_chats(update.effective_message, context)
+
+
+async def send_registered_chats(message, context):
+    chats = await db.list_registered_chats()
+    if not chats:
+        await message.reply_text(
+            "💬 لا توجد محادثات مسجلة.\n"
+            "اطلب من أدمن الجروب إضافة البوت ثم إرسال /register_chat.")
+        return
+    rows = []
+    lines = ["💬 <b>المحادثات الطبية المسجلة</b>", ""]
+    for item in chats:
+        state = "✅ معتمدة" if item["enabled"] else "⏳ معلقة"
+        title = html_escape(item["title"] or str(item["chat_id"]))
+        lines.append(f"• {title} | <code>{item['chat_id']}</code> | {state}")
+        rows.append([InlineKeyboardButton(
+            f"{'🛑' if item['enabled'] else '✅'} {item['title'][:35]}",
+            callback_data=f"admin:chat_toggle:{item['chat_id']}")])
+    rows.append([InlineKeyboardButton("🔙 لوحة الأدمن", callback_data="admin:refresh")])
+    await message.reply_text("\n".join(lines), parse_mode="HTML",
+                             reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def dismiss_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove the old inline panel when the user starts another bot action."""
+    message_id = context.user_data.pop("admin_panel_message_id", None)
+    if message_id is None:
+        return
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=message_id,
+        )
+    except BadRequest as exc:
+        logger.debug("Admin panel was already removed: %s", exc)
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1105,7 +1327,9 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      or context.user_data.get("pdf_images")
                      or context.user_data.get("image_data")
                      or context.user_data.get("mode") in ("smart_chat", "spot_diag",
-                                                           "qfile", "quran_search"))
+                                                           "qfile", "quran_search",
+                                                           "pdf_restyle_upload", "pdf_restyle_prompt",
+                                                           "virtual_patient"))
     clear_flow_state(context)
     context.user_data.pop("mode", None)
     context.user_data.pop("smart_history", None)
@@ -1147,9 +1371,69 @@ async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML", reply_markup=build_admin_keyboard_inline())
         return
 
+    if action == "toggle_pdf_restyle":
+        new_value = not _PDF_RESTYLE_ENABLED
+        await _set_pdf_restyle_enabled(new_value)
+        if new_value:
+            import pdf_restyle
+            context.user_data["mode"] = pdf_restyle.MODE_UPLOAD
+            context.user_data.pop("restyle_pdf_text", None)
+            context.user_data.pop("restyle_pdf_images", None)
+            await safe_edit(
+                query,
+                "✅ PDF AI اتفعل. ابعت ملف PDF دلوقتي لإعادة تنسيقه، وبعدها اكتب وصف التصميم.",
+                parse_mode="HTML",
+            )
+        else:
+            await safe_edit(query, await build_admin_panel_text(),
+                            parse_mode="HTML", reply_markup=build_admin_keyboard_inline())
+        return
+
+    if action == "toggle_virtual_patient":
+        await _set_virtual_patient_enabled(not _VIRTUAL_PATIENT_ENABLED)
+        await safe_edit(query, await build_admin_panel_text(),
+                        parse_mode="HTML", reply_markup=build_admin_keyboard_inline())
+        return
+
+    if action == "pdf_tokens_prompt":
+        context.user_data["admin_action"] = "awaiting_pdf_tokens"
+        touch_state(context)
+        await safe_edit(query,
+                        "🎟️ ابعت: <code>user_id amount</code>\n"
+                        "مثال: <code>123456789 10</code>\n"
+                        "استخدم amount سالب لسحب tokens.", parse_mode="HTML")
+        return
+
+    if action == "pdf_cost_prompt":
+        context.user_data["admin_action"] = "awaiting_pdf_cost"
+        touch_state(context)
+        await safe_edit(query,
+                        f"💰 ابعت تكلفة العملية من 1 إلى 100. الحالية: {_PDF_RESTYLE_COST}")
+        return
+
     if action == "refresh":
         await safe_edit(query, await build_admin_panel_text(),
                         parse_mode="HTML", reply_markup=build_admin_keyboard_inline())
+        return
+
+    if action == "chats":
+        await send_registered_chats(query.message, context)
+        return
+
+    if action == "chat_toggle" and len(parts) >= 3:
+        try:
+            chat_id = int(parts[2])
+        except ValueError:
+            await query.answer("معرف محادثة غير صحيح", show_alert=True)
+            return
+        chats = await db.list_registered_chats()
+        current = next((item for item in chats if item["chat_id"] == chat_id), None)
+        if current is None:
+            await query.answer("المحادثة غير موجودة", show_alert=True)
+            return
+        await db.set_chat_enabled(chat_id, not current["enabled"])
+        await query.answer("تم تحديث حالة المحادثة")
+        await send_registered_chats(query.message, context)
         return
 
     if action == "analytics":
@@ -1171,6 +1455,19 @@ async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, build_multi_add_prompt(), parse_mode="HTML")
         return
 
+    if action == "search_prompt":
+        context.user_data["admin_action"] = "awaiting_user_search"
+        touch_state(context)
+        await safe_edit(
+            query,
+            "🔎 <b>بحث عن مستخدم</b>\n\n"
+            "ابعت الـID أو اليوزر أو الاسم.\n"
+            "مثال: <code>123456789</code> أو <code>ahmed</code>\n\n"
+            "<i>/cancel للإلغاء</i>",
+            parse_mode="HTML",
+        )
+        return
+
     if action == "broadcast_prompt":
         context.user_data["admin_action"] = "awaiting_broadcast"
         touch_state(context)
@@ -1180,6 +1477,14 @@ async def on_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"اكتب الرسالة اللي عايز تبعتها لكل المستخدمين ({total}).\n\n"
             f"<i>/cancel للإلغاء</i>",
             parse_mode="HTML")
+        return
+
+    if action == "media_broadcast_prompt":
+        context.user_data["admin_action"] = "awaiting_media_target"
+        touch_state(context)
+        await safe_edit(query,
+                        "📸🎬 اكتب <code>all</code> لكل المستخدمين أو ابعت User ID واحد.",
+                        parse_mode="HTML")
         return
 
     if action == "list_users":
@@ -1282,7 +1587,49 @@ async def on_settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============================================================
 # Document handler
 # ============================================================
+async def handle_admin_media_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if context.user_data.get("admin_action") != "awaiting_media_upload":
+        return
+
+    message = update.effective_message
+    media_type = ""
+    file_id = ""
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        file_id = message.video.file_id
+    elif message.document:
+        mime = (message.document.mime_type or "").lower()
+        if mime.startswith("image/"):
+            media_type = "photo"
+            file_id = message.document.file_id
+
+    if not file_id:
+        await message.reply_text("❌ ابعت صورة أو فيديو فقط.")
+        raise ApplicationHandlerStop
+
+    target = context.user_data.pop("media_broadcast_target", "")
+    context.user_data.pop("admin_action", None)
+    caption = message.caption or ""
+    addons.track(
+        "media_broadcast",
+        do_media_broadcast(context, update.effective_user.id, target,
+                           media_type, file_id, caption),
+    )
+    await message.reply_text("📤 بدأ إرسال الوسائط في الخلفية…")
+    raise ApplicationHandlerStop
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("mode") == "pdf_restyle_upload":
+        import pdf_restyle
+        await pdf_restyle._intercept_document(update, context)
+        return
+
     if not await ensure_access(update):
         return
 
@@ -1736,6 +2083,7 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, sender_id: int,
     except Exception:
         pass
 
+
     header = "📢 <b>رسالة من الإدارة:</b>\n\n"
     for i, uid in enumerate(targets, 1):
         if uid == sender_id:
@@ -1779,6 +2127,37 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, sender_id: int,
         pass
 
 
+async def do_media_broadcast(context: ContextTypes.DEFAULT_TYPE, sender_id: int,
+                             target: str, media_type: str, file_id: str,
+                             caption: str = ""):
+    targets = (await db.list_allowed_user_ids()
+               if target == "all" else [int(target)])
+    sent = failed = blocked = 0
+    for uid in targets:
+        if target == "all" and uid == sender_id:
+            continue
+        try:
+            if media_type == "photo":
+                await context.bot.send_photo(uid, photo=file_id, caption=caption or None)
+            else:
+                await context.bot.send_video(uid, video=file_id, caption=caption or None)
+            sent += 1
+        except Forbidden:
+            blocked += 1
+        except Exception as exc:
+            logger.warning("Media broadcast to %d failed: %s", uid, exc)
+            failed += 1
+        await asyncio.sleep(BROADCAST_DELAY)
+
+    summary = (f"✅ <b>تم إرسال الوسائط</b>\n\n"
+               f"المستهدف: {'كل المستخدمين' if target == 'all' else target}\n"
+               f"تم: {sent}\nمحظور البوت: {blocked}\nفشل: {failed}")
+    try:
+        await context.bot.send_message(sender_id, summary, parse_mode="HTML")
+    except Exception:
+        logger.debug("Could not send media broadcast summary", exc_info=True)
+
+
 # ============================================================
 # Text handler
 # ============================================================
@@ -1786,12 +2165,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.get_or_create_user(update.effective_user)
     user_id = update.effective_user.id
     text    = (update.message.text or "").strip()
+    await dismiss_admin_panel(update, context)
 
     if state_is_stale(context):
         clear_flow_state(context)
 
+    if is_admin(user_id) and text == BTN_TOGGLE_VIRTUAL_PATIENT:
+        await _set_virtual_patient_enabled(not _VIRTUAL_PATIENT_ENABLED)
+        state = "✅ شغال" if _VIRTUAL_PATIENT_ENABLED else "🛑 متوقف"
+        await update.message.reply_text(
+            f"🩺 المريض الافتراضي: {state}",
+            reply_markup=get_keyboard_for(user_id))
+        return
+
     # ── v5: Quran search-by-text (islamic module) ──
     if await islamic.handle_search_text(update, context, text):
+        return
+
+    # ── Admin: search users by ID, username, or name ──
+    if is_admin(user_id) and context.user_data.get("admin_action") == "awaiting_user_search":
+        context.user_data.pop("admin_action", None)
+        if not text:
+            await update.message.reply_text("❌ اكتب ID أو اسم أو يوزر للبحث.")
+            return
+        result_text, result_kb = await build_user_search_results(text, bot=context.bot)
+        await update.message.reply_text(result_text, parse_mode="HTML",
+                                        reply_markup=result_kb)
         return
 
     # ── Admin: awaiting a user ID to add ──
@@ -1869,46 +2268,101 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=get_keyboard_for(user_id))
         return
 
-    # ── User typing question count ──
-    if context.user_data.get("awaiting_question_count"):
-        if not await ensure_access(update):
-            return
-        try:
-            n = int(text)
-        except ValueError:
-            await update.message.reply_text(
-                f"❌ ابعت رقم صحيح من {MIN_QUESTIONS} لـ {MAX_QUESTIONS}")
-            return
-        if n < MIN_QUESTIONS or n > MAX_QUESTIONS:
-            await update.message.reply_text(
-                f"❌ الرقم لازم يكون بين {MIN_QUESTIONS} و {MAX_QUESTIONS}")
-            return
-        context.user_data.pop("awaiting_question_count", None)
-        # v5: run as a tracked background task so a 200-question job doesn't
-        # tie up this handler; concurrent_updates keeps everyone else free.
-        addons.track("mcq_gen", generate_mcqs_and_send(update, context, n))
+    if is_admin(user_id) and context.user_data.get("admin_action") == "awaiting_media_target":
+        target_text = text.strip().lower()
+        if target_text == "all":
+            target = "all"
+        else:
+            try:
+                target_id = int(target_text)
+                if target_id <= 0 or not await db.is_allowed(target_id, ADMIN_IDS):
+                    raise ValueError
+            except (ValueError, TypeError):
+                await update.message.reply_text(
+                    "❌ اكتب all أو User ID لمستخدم مسموح له.")
+                return
+            target = str(target_id)
+        context.user_data["admin_action"] = "awaiting_media_upload"
+        context.user_data["media_broadcast_target"] = target
+        touch_state(context)
+        await update.message.reply_text(
+            f"✅ المستهدف: {'كل المستخدمين' if target == 'all' else target}\n"
+            "ابعت صورة أو فيديو الآن. يمكن أن تضع الوصف داخل Caption.")
         return
 
-    # ── v5 feature buttons (work for both user and admin) ──
-    if text == BTN_SPOT:
-        await addons.cmd_spot(update, context)
+    if is_admin(user_id) and context.user_data.get("admin_action") == "awaiting_pdf_tokens":
+        context.user_data.pop("admin_action", None)
+        parts = text.split()
+        try:
+            target_id, amount = int(parts[0]), int(parts[1])
+            if len(parts) != 2 or target_id <= 0 or amount == 0:
+                raise ValueError
+        except (ValueError, IndexError):
+            await update.message.reply_text("❌ الصيغة الصحيحة: user_id amount مثل 123456789 10")
+            return
+        balance = await db.add_pdf_tokens(target_id, amount)
+        await update.message.reply_text(
+            f"✅ رصيد <code>{target_id}</code>: <b>{balance}</b> token",
+            parse_mode="HTML", reply_markup=get_keyboard_for(user_id))
         return
-    if text == BTN_QFILE:
-        await addons._cmd_qfile(update, context)
+
+    if is_admin(user_id) and context.user_data.get("admin_action") == "awaiting_pdf_cost":
+        context.user_data.pop("admin_action", None)
+        try:
+            cost = int(text)
+            if not 1 <= cost <= 100:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ التكلفة لازم تكون رقم من 1 إلى 100.")
+            return
+        await _set_pdf_restyle_cost(cost)
+        await update.message.reply_text(f"✅ تكلفة إعادة تنسيق PDF أصبحت {cost} token.",
+                                        reply_markup=get_keyboard_for(user_id))
         return
+
+    if context.user_data.get("mode") == "pdf_restyle_prompt":
+        import pdf_restyle
+        await pdf_restyle.handle_prompt(update, context, text)
+        return
+
+    if context.user_data.get("mode") == "virtual_patient":
+        import virtual_patient
+        if await virtual_patient.handle_text(update, context, text):
+            return
+
+    # ── Shared buttons ──
     if text == BTN_ISLAMIC:
         await islamic.cmd_islamic(update, context)
         return
-    if text == BTN_PDFTOOLS:
-        import pdftools_menu
-        await pdftools_menu.cmd_pdftools(update, context)
+
+    if text == BTN_SPOT:
+        await addons.cmd_spot(update, context)
         return
+
+    if text == BTN_QFILE:
+        await addons._cmd_qfile(update, context)
+        return
+
+    if text == BTN_PDF_RESTYLE:
+        import pdf_restyle
+        await pdf_restyle.cmd_restyle(update, context)
+        return
+
     if text == BTN_MEDICAL:
         import medical
         await medical.cmd_diagnose(update, context)
         return
 
-    # ── Shared buttons ──
+    if text == BTN_CLINICAL:
+        import medical
+        await medical.cmd_clinical(update, context)
+        return
+
+    if text == BTN_VIRTUAL_PATIENT:
+        import virtual_patient
+        await virtual_patient.cmd_virtual_patient(update, context)
+        return
+
     if text == BTN_HELP:
         if is_admin(user_id):
             help_text = (
@@ -1918,14 +2372,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 📋 <b>كويز من ملف</b>: ملف أسئلة جاهز → كويز\n"
                 "• 🕌 <b>إسلامي</b>: أذكار + قرآن + استماع\n"
                 "• 🤖 <b>الوضع الذكي</b>: Q&amp;A مع Gemini\n"
-                "• 🎛️ <b>لوحة التحكم</b>: تشغيل/إيقاف\n"
-                "• 👥 <b>إدارة المستخدمين</b>\n"
-                "• ➕👥 <b>إضافة جماعية</b>: إضافة كذا ID مرة واحدة\n"
-                "• 🤖 <b>لوحة الذكي</b>: تشغيل/تعطيل الوضع الذكي جماعي\n"
-                "• 💾 <b>نسخة احتياطية</b> / ♻️ <b>استعادة</b> للمستخدمين\n"
-                "• 📈 <b>إحصائيات</b>\n"
-                "• 📢 <b>رسالة جماعية</b>\n"
-                "• 🙈 <b>إخفاء لوحة الأدمن</b>\n\n"
+                "• 🎁 <b>ادعو أصحابك</b>: لينك إحالة + محاضرات هدية\n\n"
+                "💡 بعد كل كويز ممكن تنزّله PDF أو Anki deck.\n\n"
                 "أوامر:\n"
                 "/start - إعادة التشغيل\n"
                 "/admin - لوحة التحكم\n"
@@ -1934,8 +2382,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/backup /restore - نسخ واستعادة\n"
                 "/health /tasks - حالة النظام والمهام\n"
                 "/spot - تشخيص صورة\n"
+                "/clinical - حالات إكلينيكية وتدريب على القرار الطبي\n"
                 "/qfile - كويز من ملف\n"
                 "/islamic - القسم الإسلامي\n"
+                "/register_chat - تسجيل الجروب الطبي بعد إضافة البوت\n"
+                "/medical_chats - إدارة المحادثات الطبية\n"
                 "/cancel - إلغاء أي عملية\n"
                 "/myid - الـID بتاعك"
             )
@@ -1951,8 +2402,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "💡 بعد كل كويز ممكن تنزّله PDF أو Anki deck.\n\n"
                 "أوامر:\n"
                 "/spot - تشخيص صورة\n"
+                "/clinical - حالات إكلينيكية وتدريب على القرار الطبي\n"
                 "/qfile - كويز من ملف\n"
                 "/islamic - القسم الإسلامي\n"
+                "/register_chat - تسجيل جروب طبي بعد إضافة البوت (بواسطة أدمن الجروب)\n"
                 "/cancel - إلغاء أي عملية\n"
                 "/myid - الـID بتاعك\n\n"
                 f"للاشتراك أو الدعم: {html_escape(ADMIN_USERNAME)}"
@@ -2018,6 +2471,46 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Admin buttons ──
     if is_admin(user_id):
+        if text == BTN_TOGGLE_VIRTUAL_PATIENT:
+            await _set_virtual_patient_enabled(not _VIRTUAL_PATIENT_ENABLED)
+            state = "✅ شغال" if _VIRTUAL_PATIENT_ENABLED else "🛑 متوقف"
+            await update.message.reply_text(
+                f"🩺 المريض الافتراضي: {state}",
+                reply_markup=get_keyboard_for(user_id))
+            return
+
+        if text == BTN_TOGGLE_PDF_RESTYLE:
+            await _set_pdf_restyle_enabled(not _PDF_RESTYLE_ENABLED)
+            state = "✅ شغال" if _PDF_RESTYLE_ENABLED else "🛑 متوقف"
+            if _PDF_RESTYLE_ENABLED:
+                import pdf_restyle
+                context.user_data["mode"] = pdf_restyle.MODE_UPLOAD
+                context.user_data.pop("restyle_pdf_text", None)
+                context.user_data.pop("restyle_pdf_images", None)
+                await update.message.reply_text(
+                    "✅ PDF AI اتفعل. ابعت ملف PDF دلوقتي لإعادة تنسيقه، وبعدها اكتب وصف التصميم.",
+                    reply_markup=get_keyboard_for(user_id))
+            else:
+                await update.message.reply_text(
+                    f"إعادة تنسيق PDF بالذكاء الاصطناعي: {state}",
+                    reply_markup=get_keyboard_for(user_id))
+            return
+
+        if text == BTN_PDF_TOKENS:
+            context.user_data["admin_action"] = "awaiting_pdf_tokens"
+            touch_state(context)
+            await update.message.reply_text(
+                "🎟️ ابعت: <code>user_id amount</code>\nمثال: <code>123456789 10</code>",
+                parse_mode="HTML")
+            return
+
+        if text == BTN_PDF_TOKEN_COST:
+            context.user_data["admin_action"] = "awaiting_pdf_cost"
+            touch_state(context)
+            await update.message.reply_text(
+                f"💰 ابعت تكلفة العملية من 1 إلى 100. الحالية: {_PDF_RESTYLE_COST}")
+            return
+
         if text == BTN_MULTI_ADD:
             context.user_data["admin_action"] = "awaiting_multi_add_ids"
             touch_state(context)
@@ -2051,10 +2544,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_keyboard_for(user_id))
             return
 
-        if text == BTN_ADMIN_PANEL:
+        if text == BTN_HIDE_FEATURES:
+            await _set_features_kb_hidden(True)
             await update.message.reply_text(
+                "🙈 تم إخفاء أزرار الأدوات من كل المستخدمين.\n"
+                "استخدم زر 👁️ إظهار الأدوات لإعادتها.",
+                reply_markup=get_keyboard_for(user_id))
+            return
+
+        if text == BTN_SHOW_FEATURES:
+            await _set_features_kb_hidden(False)
+            await update.message.reply_text(
+                "👁️ تم إظهار أزرار الأدوات.",
+                reply_markup=get_keyboard_for(user_id))
+            return
+
+        if text == BTN_ADMIN_PANEL:
+            panel_message = await update.message.reply_text(
                 await build_admin_panel_text(), parse_mode="HTML",
                 reply_markup=build_admin_keyboard_inline())
+            context.user_data["admin_panel_message_id"] = panel_message.message_id
             return
 
         if text == BTN_MANAGE_USERS:
@@ -2064,6 +2573,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             panel_text, kb = await build_users_list_inline(0, bot=context.bot)
             await update.message.reply_text(panel_text, parse_mode="HTML", reply_markup=kb)
+            return
+
+        if text == BTN_MANAGE_CHATS:
+            await send_registered_chats(update.message, context)
             return
 
         if text == BTN_ANALYTICS:
@@ -2095,6 +2608,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📢 <b>رسالة جماعية</b>\n\n"
                 f"اكتب الرسالة لكل المستخدمين ({total}).\n\n"
                 f"<i>/cancel للإلغاء</i>", parse_mode="HTML")
+            return
+
+        if text == BTN_MEDIA_BROADCAST:
+            context.user_data["admin_action"] = "awaiting_media_target"
+            touch_state(context)
+            await update.message.reply_text(
+                "📸🎬 اكتب <code>all</code> لكل المستخدمين أو ابعت User ID واحد.",
+                parse_mode="HTML")
             return
 
         if text == BTN_TOGGLE_BOT:
@@ -2521,7 +3042,16 @@ def main():
     app.add_handler(CommandHandler("admin",  admin_panel))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("stats",  stats_cmd))
+    app.add_handler(CommandHandler("register_chat", register_chat_cmd))
+    app.add_handler(CommandHandler("medical_chats", registered_chats_cmd))
 
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.Document.ALL,
+            handle_admin_media_broadcast,
+        ),
+        group=-6,
+    )
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO,        handle_photo))
 
@@ -2537,11 +3067,12 @@ def main():
 
     # v5: register the add-on feature modules (commands, callbacks and the
     # high-priority document/photo interceptors for Spot / Quiz-from-file).
-    import medical, pdftools_menu
+    import medical, pdf_restyle, virtual_patient
     addons.register(app)
     islamic.register(app)            # uses the new islamic.py
     medical.register(app)            # group -2: runs before addons' interceptors
-    pdftools_menu.register(app)
+    pdf_restyle.register(app)        # group -4: intercepts PDF restyle uploads
+    virtual_patient.register(app)
 
     if WEBHOOK_URL:
         url = WEBHOOK_URL.rstrip("/") + "/" + WEBHOOK_PATH

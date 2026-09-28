@@ -47,16 +47,17 @@ def _menu() -> InlineKeyboardMarkup:
     office = pdftools.soffice_available()
     rows, row = [], []
     for op, (label, needs) in OPS.items():
+        button_label = label
         if needs and not office:
-            continue
-        row.append(InlineKeyboardButton(label, callback_data=f"pdft:op:{op}"))
+            button_label += " ⚠️"
+        row.append(InlineKeyboardButton(button_label, callback_data=f"pdft:op:{op}"))
         if len(row) == 2:
             rows.append(row); row = []
     if row:
         rows.append(row)
     if not office:
         rows.append([InlineKeyboardButton(
-            "ℹ️ تحويلات Office تحتاج LibreOffice على السيرفر",
+            "ℹ️ Word/PPT → PDF تحتاج LibreOffice",
             callback_data="pdft:noop")])
     return InlineKeyboardMarkup(rows)
 
@@ -98,6 +99,12 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if parts[1] == "op":
         op = parts[2]
+        if OPS[op][1] and not pdftools.soffice_available():
+            await q.answer(
+                "ثبّت LibreOffice أولاً لتفعيل تحويل Word/PowerPoint إلى PDF.",
+                show_alert=True,
+            )
+            return
         context.user_data[MODE] = True
         context.user_data["pdftool_op"] = op
         context.user_data["pdftool_files"] = []
@@ -247,6 +254,6 @@ async def _send_result(update, op, result):
 def register(app: Application):
     app.add_handler(CommandHandler("pdftools", cmd_pdftools))
     app.add_handler(CallbackQueryHandler(on_cb, pattern=r"^pdft:"))
-    app.add_handler(MessageHandler(filters.Document.ALL, _intercept), group=-1)
-    app.add_handler(MessageHandler(filters.PHOTO, _intercept), group=-1)
+    app.add_handler(MessageHandler(filters.Document.ALL, _intercept), group=-3)
+    app.add_handler(MessageHandler(filters.PHOTO, _intercept), group=-3)
     logger.info("pdftools_menu registered")

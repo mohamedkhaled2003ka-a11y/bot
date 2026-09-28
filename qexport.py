@@ -45,6 +45,7 @@ _FONT_CANDIDATES = [
     os.path.join(_HERE, "Amiri-Regular.ttf"),
     "/usr/share/fonts/truetype/amiri/Amiri-Regular.ttf",
     "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+    r"C:\Windows\Fonts\arial.ttf",
 ]
 
 _ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")

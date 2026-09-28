@@ -64,6 +64,13 @@ RECITERS = {
     "ar.muhammadayyoub":     "محمد أيوب",
     "ar.muhammadjibreel":    "محمد جبريل",
     "ar.saoodshuraym":       "سعود الشريم",
+    "ar.dossari":             "ياسر الدوسري",
+    "ar.abdullahaljuhany":    "عبد الله الجهني",
+    "ar.aymansweid":          "أيمن سويد",
+    "ar.nasseralqatami":      "ناصر القطامي",
+    "ar.faresabbad":          "فارس عباد",
+    "ar.idreesabkar":         "إدريس أبكر",
+    "ar.khalilalhosary":      "محمود خليل الحصري",
 }
 
 READ_CHUNK = 3500
@@ -157,7 +164,7 @@ async def _verify_reciters() -> dict[str, int]:
         if cached:
             _VERIFIED = {k: int(v) for k, v in json.loads(cached).items()
                          if k in RECITERS}
-            if _VERIFIED:
+            if _VERIFIED and set(RECITERS).issubset(_VERIFIED):
                 return _VERIFIED
     except Exception:
         pass
