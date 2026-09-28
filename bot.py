@@ -90,7 +90,20 @@ def _load_gemini_keys() -> list[str]:
             continue
         for k in re.split(r"[,\s;]+", raw):
             k = k.strip()
-            if k and k not in keys:
+            if not k:
+                continue
+            # Gemini API keys are API-key credentials (typically start with
+            # "AIza"). Do not pass OAuth access tokens such as "AQ..." to
+            # genai.Client(api_key=...), because Google rejects them with
+            # 401 ACCESS_TOKEN_TYPE_UNSUPPORTED.
+            if not k.startswith("AIza"):
+                print(
+                    f"WARNING: Ignoring a non-API-key credential in {var}. "
+                    "Use Gemini API keys from Google AI Studio (typically "
+                    "starting with 'AIza'), not OAuth access tokens."
+                )
+                continue
+            if k not in keys:
                 keys.append(k)
     return keys[:20]
 
@@ -2169,22 +2182,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state_is_stale(context):
         clear_flow_state(context)
-    # ── MCQ: awaiting question count ──
-    if context.user_data.get("awaiting_question_count"):
-        try:
-            n_questions = int(text)
-            if n_questions < MIN_QUESTIONS or n_questions > MAX_QUESTIONS:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text(
-                f"❌ اكتب رقم صحيح من {MIN_QUESTIONS} لـ {MAX_QUESTIONS}.",
-                reply_markup=get_keyboard_for(user_id)
-            )
-            return
-
-        context.user_data.pop("awaiting_question_count", None)
-        await generate_mcqs_and_send(update, context, n_questions)
-        return
 
     if is_admin(user_id) and text == BTN_TOGGLE_VIRTUAL_PATIENT:
         await _set_virtual_patient_enabled(not _VIRTUAL_PATIENT_ENABLED)
