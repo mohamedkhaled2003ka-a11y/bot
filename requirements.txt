@@ -1,0 +1,44 @@
+# MedQuiz Ai — Python dependencies
+# Pin versions to whatever you already run in production; these are the
+# packages the code imports. dbtools.py needs NOTHING here (stdlib only).
+
+# Core
+python-telegram-bot[job-queue]>=21.0   # telegram, telegram.ext
+                                       # [job-queue] is REQUIRED for the new
+                                       # Azkar daily reminders (islamic.py)
+google-genai                           # google.genai (Gemini)
+
+# PDF / file parsing
+pdfplumber                     # pdfplumber
+PyMuPDF                        # imported as "fitz"
+python-docx                    # quiz-from-DOCX (addons.py) + PDF->Word
+httpx                          # Quran API (islamic.py); also a PTB dep
+
+# Database (used by YOUR db.py / migrate.py — keep your existing versions)
+SQLAlchemy>=2.0
+aiosqlite
+
+# Export (used by YOUR export.py — keep your existing versions)
+reportlab                      # PDF export; also used by the new Arabic export
+genanki                        # Anki .apkg export
+
+# ─────────────────────────────────────────────────────────────
+# v6 additions
+# ─────────────────────────────────────────────────────────────
+
+# Arabic-correct MCQ -> PDF export (qexport.py)
+arabic-reshaper                # Arabic letter shaping
+python-bidi                    # right-to-left ordering
+
+# PDF Tools engine (pdftools.py / pdftools_menu.py)
+pikepdf                        # PDF compression
+pdf2docx                       # PDF -> Word
+python-pptx                    # PPT/PDF slide handling
+Pillow                         # image <-> PDF handling
+
+# NOTE: Word->PDF, PPT->PDF and PDF->PPT also need LibreOffice installed on the
+# host (the `soffice` binary on PATH) — it is a system package, NOT a pip
+# package. On Debian/Ubuntu:  apt-get install -y libreoffice
+# The pure-Python tools (Image<->PDF, merge, split, compress, PDF->Word) work
+# without it, and the menu hides the LibreOffice-only buttons when it's absent.
+fpdf==1.7.2
