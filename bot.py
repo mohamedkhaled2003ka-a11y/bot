@@ -113,7 +113,6 @@ GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 ADMIN_IDS = {
     8015150141,  # MK
-    8070875099,  # 7oss
 }
 ADMIN_USERNAME = "@VOLDYI"
 
